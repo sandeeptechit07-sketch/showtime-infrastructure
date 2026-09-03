@@ -7,6 +7,7 @@ on:
         description: "Movie Service Docker tag"
         required: true
         type: string
+
       gateway_tag:
         description: "Gateway Docker tag"
         required: true
@@ -37,21 +38,41 @@ jobs:
 
             cd ~/showtime-infrastructure
 
-            echo "Deployment event: ${{ github.event.action }}"
+            echo "======================================"
+            echo "Starting ShowTime deployment"
+            echo "======================================"
+
+            # -------------------------------------------------
+            # Backup current deployment configuration
+            # -------------------------------------------------
+            if [ -f .env ]; then
+              cp .env .env.previous
+              chmod 600 .env.previous
+              echo "Previous deployment configuration backed up."
+            fi
+
+            # -------------------------------------------------
+            # Update deployment tags
+            # -------------------------------------------------
 
             if [ "${{ github.event.action }}" = "deploy-movie-service" ]; then
-              echo "Deploying Movie Service"
+
+              echo "Deploying Movie Service:"
+              echo "Tag: ${{ github.event.client_payload.image_tag }}"
 
               sed -i '/^MOVIE_SERVICE_TAG=/d' .env
               echo "MOVIE_SERVICE_TAG=${{ github.event.client_payload.image_tag }}" >> .env
 
             elif [ "${{ github.event.action }}" = "deploy-gateway" ]; then
-              echo "Deploying Gateway"
+
+              echo "Deploying Gateway:"
+              echo "Tag: ${{ github.event.client_payload.image_tag }}"
 
               sed -i '/^GATEWAY_TAG=/d' .env
               echo "GATEWAY_TAG=${{ github.event.client_payload.image_tag }}" >> .env
 
             else
+
               echo "Manual deployment"
 
               cat > .env <<EOF
@@ -59,15 +80,125 @@ jobs:
             MOVIE_SERVICE_TAG=${{ inputs.movie_service_tag }}
             GATEWAY_TAG=${{ inputs.gateway_tag }}
             EOF
+
             fi
 
             chmod 600 .env
 
+            echo ""
             echo "Deployment configuration:"
             grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
 
+            # -------------------------------------------------
+            # Pull new images
+            # -------------------------------------------------
+
+            echo ""
+            echo "Pulling Docker images..."
+
             docker compose pull
+
+            # -------------------------------------------------
+            # Start/recreate containers
+            # -------------------------------------------------
+
+            echo ""
+            echo "Starting containers..."
 
             docker compose up -d --force-recreate
 
+            # -------------------------------------------------
+            # Wait for health checks
+            # -------------------------------------------------
+
+            echo ""
+            echo "Waiting for services to become healthy..."
+
+            MAX_ATTEMPTS=12
+            ATTEMPT=1
+
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+
+              MOVIE_STATUS=$(docker inspect movie-service \
+                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}')
+
+              GATEWAY_STATUS=$(docker inspect showtime-gateway \
+                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}')
+
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS"
+              echo "Movie Service : $MOVIE_STATUS"
+              echo "Gateway       : $GATEWAY_STATUS"
+
+              if [ "$MOVIE_STATUS" = "healthy" ] &&
+                 [ "$GATEWAY_STATUS" = "healthy" ]; then
+
+                echo ""
+                echo "======================================"
+                echo "Deployment successful"
+                echo "======================================"
+
+                docker compose ps
+
+                exit 0
+              fi
+
+              sleep 10
+              ATTEMPT=$((ATTEMPT + 1))
+
+            done
+
+            # -------------------------------------------------
+            # Deployment failed
+            # -------------------------------------------------
+
+            echo ""
+            echo "======================================"
+            echo "Deployment failed health checks"
+            echo "======================================"
+
+            echo ""
+            echo "Container status:"
             docker compose ps
+
+            echo ""
+            echo "Movie Service logs:"
+            docker logs --tail 100 movie-service || true
+
+            echo ""
+            echo "Gateway logs:"
+            docker logs --tail 100 showtime-gateway || true
+
+            # -------------------------------------------------
+            # Rollback
+            # -------------------------------------------------
+
+            if [ -f .env.previous ]; then
+
+              echo ""
+              echo "======================================"
+              echo "Rolling back deployment"
+              echo "======================================"
+
+              cp .env.previous .env
+              chmod 600 .env
+
+              echo "Restoring previous image tags:"
+              grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
+
+              docker compose pull
+              docker compose up -d --force-recreate
+
+              echo ""
+              echo "Rollback completed."
+
+              docker compose ps
+
+            else
+
+              echo ""
+              echo "No previous deployment configuration found."
+              echo "Automatic rollback is not possible."
+
+            fi
+
+            exit 1
