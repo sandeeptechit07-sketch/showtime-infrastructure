@@ -1,7 +1,7 @@
 services:
 
   movie-service:
-    image: sandeep07k/movie-service:1.0.0
+    image: sandeep07k/movie-service:${MOVIE_SERVICE_TAG}
     container_name: movie-service
     environment:
       MONGODB_URI: ${MONGODB_URI}
@@ -18,7 +18,7 @@ services:
         awslogs-create-group: "true"
 
   showtime-gateway:
-    image: sandeep07k/showtime-gateway:1.0.0
+    image: sandeep07k/showtime-gateway:${GATEWAY_TAG}
     container_name: showtime-gateway
     ports:
       - "8080:8080"
