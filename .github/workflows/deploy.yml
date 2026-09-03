@@ -6,9 +6,16 @@ on:
       movie_service_tag:
         description: "Movie Service Docker tag"
         required: true
+        type: string
       gateway_tag:
         description: "Gateway Docker tag"
         required: true
+        type: string
+
+  repository_dispatch:
+    types:
+      - deploy-movie-service
+      - deploy-gateway
 
 permissions:
   contents: read
@@ -19,7 +26,7 @@ jobs:
 
     steps:
       - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@v1.2.4
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
@@ -30,11 +37,29 @@ jobs:
 
             cd ~/showtime-infrastructure
 
-            cat > .env <<EOF
+            echo "Deployment event: ${{ github.event.action }}"
+
+            if [ "${{ github.event.action }}" = "deploy-movie-service" ]; then
+              echo "Deploying Movie Service"
+
+              sed -i '/^MOVIE_SERVICE_TAG=/d' .env
+              echo "MOVIE_SERVICE_TAG=${{ github.event.client_payload.image_tag }}" >> .env
+
+            elif [ "${{ github.event.action }}" = "deploy-gateway" ]; then
+              echo "Deploying Gateway"
+
+              sed -i '/^GATEWAY_TAG=/d' .env
+              echo "GATEWAY_TAG=${{ github.event.client_payload.image_tag }}" >> .env
+
+            else
+              echo "Manual deployment"
+
+              cat > .env <<EOF
             MONGODB_URI=${{ secrets.MONGODB_URI }}
             MOVIE_SERVICE_TAG=${{ inputs.movie_service_tag }}
             GATEWAY_TAG=${{ inputs.gateway_tag }}
             EOF
+            fi
 
             chmod 600 .env
 
@@ -42,5 +67,7 @@ jobs:
             grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
 
             docker compose pull
+
             docker compose up -d --force-recreate
+
             docker compose ps
