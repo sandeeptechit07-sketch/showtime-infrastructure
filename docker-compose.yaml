@@ -1,0 +1,25 @@
+services:
+
+  movie-service:
+    image: movie-service:latest
+    container_name: movie-service
+    env_file:
+      - ./movie-service/.env
+    ports:
+      - "8082:8082"
+    networks:
+      - showtime-network
+
+  showtime-gateway:
+    image: showtime-gateway:latest
+    container_name: showtime-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - movie-service
+    networks:
+      - showtime-network
+
+networks:
+  showtime-network:
+    driver: bridge
