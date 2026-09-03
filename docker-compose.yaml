@@ -9,6 +9,13 @@ services:
       - "8082:8082"
     networks:
       - showtime-network
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /showtime/movie-service
+        awslogs-stream: movie-service
+        awslogs-create-group: "true"
 
   showtime-gateway:
     image: sandeep07k/showtime-gateway:1.0.0
@@ -19,6 +26,13 @@ services:
       - movie-service
     networks:
       - showtime-network
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ap-south-1
+        awslogs-group: /showtime/gateway
+        awslogs-stream: showtime-gateway
+        awslogs-create-group: "true"
 
 networks:
   showtime-network:
