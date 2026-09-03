@@ -3,12 +3,16 @@ services:
   movie-service:
     image: sandeep07k/movie-service:${MOVIE_SERVICE_TAG}
     container_name: movie-service
+
     environment:
       MONGODB_URI: ${MONGODB_URI}
+
     ports:
       - "8082:8082"
+
     networks:
       - showtime-network
+
     logging:
       driver: awslogs
       options:
@@ -20,12 +24,16 @@ services:
   showtime-gateway:
     image: sandeep07k/showtime-gateway:${GATEWAY_TAG}
     container_name: showtime-gateway
+
     ports:
       - "8080:8080"
+
     depends_on:
       - movie-service
+
     networks:
       - showtime-network
+
     logging:
       driver: awslogs
       options:
