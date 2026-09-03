@@ -24,14 +24,23 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
           script: |
+            set -e
+
             cd ~/showtime-infrastructure
 
-            export MOVIE_SERVICE_TAG="${{ inputs.movie_service_tag }}"
-            export GATEWAY_TAG="${{ inputs.gateway_tag }}"
+            cat > .env <<EOF
+            MONGODB_URI=${{ secrets.MONGODB_URI }}
+            MOVIE_SERVICE_TAG=${{ inputs.movie_service_tag }}
+            GATEWAY_TAG=${{ inputs.gateway_tag }}
+            EOF
 
-            export MONGODB_URI="${{ secrets.MONGODB_URI }}"
+            chmod 600 .env
+
+            echo "Deployment configuration:"
+            grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
 
             docker compose pull
-            docker compose up -d
+            docker compose up -d --force-recreate
             docker compose ps
