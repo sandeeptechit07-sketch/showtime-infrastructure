@@ -38,12 +38,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------
+      # 1. Authenticate GitHub Actions with AWS using OIDC
+      # --------------------------------------------------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # --------------------------------------------------
+      # 2. Determine service and Docker image tag
+      # --------------------------------------------------
       - name: Determine Deployment Target
         id: target
         shell: bash
@@ -91,13 +97,16 @@ jobs:
           echo "Deployment target: $SERVICE"
           echo "Image tag: $TAG"
 
+      # --------------------------------------------------
+      # 3. Prevent overlapping ASG refreshes
+      # --------------------------------------------------
       - name: Check for Active Instance Refresh
         run: |
           set -euo pipefail
 
           ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
             --auto-scaling-group-name "$ASG_NAME" \
-            --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress'].InstanceRefreshId" \
+            --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Cancelling' || Status=='RollbackInProgress'].InstanceRefreshId" \
             --output text)
 
           if [ -n "$ACTIVE_REFRESH" ] && [ "$ACTIVE_REFRESH" != "None" ]; then
@@ -107,9 +116,14 @@ jobs:
 
           echo "No active Instance Refresh found."
 
+      # --------------------------------------------------
+      # 4. Capture currently deployed image SHA
+      # --------------------------------------------------
       - name: Capture Previous Image Tag
         id: previous
         run: |
+          set -euo pipefail
+
           if [ "${{ steps.target.outputs.service }}" = "movie-service" ]; then
             PARAMETER_NAME="/showtime/production/MOVIE_SERVICE_TAG"
           else
@@ -126,27 +140,43 @@ jobs:
 
           echo "Previous deployed image tag: $PREVIOUS_TAG"
 
+      # --------------------------------------------------
+      # 5. Update Movie Service image SHA
+      # --------------------------------------------------
       - name: Update Movie Service Image Tag
         if: steps.target.outputs.service == 'movie-service'
         run: |
+          set -euo pipefail
+
           aws ssm put-parameter \
             --name "/showtime/production/MOVIE_SERVICE_TAG" \
             --type "String" \
             --value "${{ steps.target.outputs.tag }}" \
             --overwrite
 
+      # --------------------------------------------------
+      # 6. Update Gateway image SHA
+      # --------------------------------------------------
       - name: Update Gateway Image Tag
         if: steps.target.outputs.service == 'gateway'
         run: |
+          set -euo pipefail
+
           aws ssm put-parameter \
             --name "/showtime/production/GATEWAY_TAG" \
             --type "String" \
             --value "${{ steps.target.outputs.tag }}" \
             --overwrite
 
+      # --------------------------------------------------
+      # 7. Start production Instance Refresh
+      # --------------------------------------------------
       - name: Start Auto Scaling Instance Refresh
+        id: refresh
         run: |
-          aws autoscaling start-instance-refresh \
+          set -euo pipefail
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --strategy Rolling \
             --preferences '{
@@ -157,16 +187,161 @@ jobs:
               "AutoRollback": true,
               "AlarmSpecification": {
                 "Alarms": [
-                  {
-                    "AlarmName": "showtime-alb-unhealthy-targets"
-                  }
+                  "showtime-alb-unhealthy-targets"
                 ]
               }
-            }'
+            }' \
+            --query "InstanceRefreshId" \
+            --output text)
 
-      - name: Deployment Summary
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "Started Instance Refresh: $REFRESH_ID"
+
+      # --------------------------------------------------
+      # 8. Monitor production deployment
+      # --------------------------------------------------
+      - name: Wait for Instance Refresh Completion
+        id: wait_deployment
         run: |
-          echo "Deployment initiated successfully."
+          set -euo pipefail
+
+          REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
+          TIMEOUT=3600
+          ELAPSED=0
+
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+
+            echo "Instance Refresh status: $STATUS"
+
+            if [ "$STATUS" = "Successful" ]; then
+              echo "Deployment completed successfully!"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "RollbackFailed" ] || \
+               [ "$STATUS" = "RollbackSuccessful" ]; then
+              echo "Deployment status: $STATUS"
+              exit 1
+            fi
+
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+
+          echo "Timed out waiting for Instance Refresh"
+          exit 1
+
+      # --------------------------------------------------
+      # 9. Restore previous image SHA on failure
+      # --------------------------------------------------
+      - name: Restore Previous Image Tag on Failure
+        id: restore
+        if: failure()
+        run: |
+          set -euo pipefail
+
+          PREVIOUS_TAG="${{ steps.previous.outputs.previous_tag }}"
+          PARAMETER_NAME="${{ steps.previous.outputs.parameter_name }}"
+
+          if [ -z "$PREVIOUS_TAG" ] || [ -z "$PARAMETER_NAME" ]; then
+            echo "Previous image tag unavailable. Cannot perform rollback."
+            exit 1
+          fi
+
+          echo "Restoring previous image tag: $PREVIOUS_TAG"
+
+          aws ssm put-parameter \
+            --name "$PARAMETER_NAME" \
+            --type "String" \
+            --value "$PREVIOUS_TAG" \
+            --overwrite
+
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "Previous image tag restored successfully."
+
+      # --------------------------------------------------
+      # 10. Start recovery Instance Refresh
+      # --------------------------------------------------
+      - name: Start Recovery Instance Refresh
+        if: failure() && steps.restore.outputs.restored == 'true'
+        id: recovery
+        run: |
+          set -euo pipefail
+
+          echo "Starting recovery deployment with previous image."
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{
+              "MinHealthyPercentage": 100,
+              "MaxHealthyPercentage": 150,
+              "InstanceWarmup": 300,
+              "SkipMatching": false
+            }' \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "Recovery refresh started: $REFRESH_ID"
+
+      # --------------------------------------------------
+      # 11. Monitor recovery deployment
+      # --------------------------------------------------
+      - name: Wait for Recovery Instance Refresh
+        if: failure() && steps.recovery.outputs.refresh_id != ''
+        run: |
+          set -euo pipefail
+
+          REFRESH_ID="${{ steps.recovery.outputs.refresh_id }}"
+          TIMEOUT=3600
+          ELAPSED=0
+
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+
+            echo "Recovery status: $STATUS"
+
+            if [ "$STATUS" = "Successful" ]; then
+              echo "Recovery completed. Previous version restored."
+              exit 0
+            fi
+
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "RollbackFailed" ] || \
+               [ "$STATUS" = "RollbackSuccessful" ]; then
+              echo "Recovery refresh failed: $STATUS"
+              exit 1
+            fi
+
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+
+          echo "Recovery timed out."
+          exit 1
+
+      # --------------------------------------------------
+      # 12. Deployment summary
+      # --------------------------------------------------
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "Deployment workflow finished."
           echo "Service: ${{ steps.target.outputs.service }}"
-          echo "Image tag: ${{ steps.target.outputs.tag }}"
+          echo "New image tag: ${{ steps.target.outputs.tag }}"
+          echo "Previous image tag: ${{ steps.previous.outputs.previous_tag }}"
           echo "ASG: $ASG_NAME"
+          echo "Deployment job status: ${{ job.status }}"
