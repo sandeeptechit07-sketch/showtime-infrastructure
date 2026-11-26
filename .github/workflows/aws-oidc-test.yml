@@ -12,11 +12,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Debug GitHub OIDC Claims
+      - name: Inspect OIDC Claims
+        shell: bash
         run: |
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Branch/Ref: $GITHUB_REF"
-          echo "Workflow: $GITHUB_WORKFLOW_REF"
+          set -e
+
+          TOKEN=$(curl -sS \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+            | jq -r '.value')
+
+          echo "$TOKEN" | jq -R 'split(".")[1] | @base64d | fromjson | {sub, aud}'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
