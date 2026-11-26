@@ -1,3 +1,4 @@
+
 name: Deploy ShowTime
 
 on:
@@ -7,7 +8,6 @@ on:
         description: "Movie Service Docker tag"
         required: true
         type: string
-
       gateway_tag:
         description: "Gateway Docker tag"
         required: true
@@ -20,185 +20,150 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+
+concurrency:
+  group: showtime-production-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ASG_NAME: showtime-asg
 
 jobs:
   deploy:
+    name: Update SSM and Refresh ASG
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.2.4
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-          script: |
-            set -e
+      - name: Check for Active Instance Refresh
+        run: |
+          set -euo pipefail
 
-            cd ~/showtime-infrastructure
+          ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Baking'].InstanceRefreshId" \
+            --output text)
 
-            echo "======================================"
-            echo "Starting ShowTime deployment"
-            echo "======================================"
-
-            # -------------------------------------------------
-            # Backup current deployment configuration
-            # -------------------------------------------------
-            if [ -f .env ]; then
-              cp .env .env.previous
-              chmod 600 .env.previous
-              echo "Previous deployment configuration backed up."
-            fi
-
-            # -------------------------------------------------
-            # Update deployment tags
-            # -------------------------------------------------
-
-            if [ "${{ github.event.action }}" = "deploy-movie-service" ]; then
-
-              echo "Deploying Movie Service:"
-              echo "Tag: ${{ github.event.client_payload.image_tag }}"
-
-              sed -i '/^MOVIE_SERVICE_TAG=/d' .env
-              echo "MOVIE_SERVICE_TAG=${{ github.event.client_payload.image_tag }}" >> .env
-
-            elif [ "${{ github.event.action }}" = "deploy-gateway" ]; then
-
-              echo "Deploying Gateway:"
-              echo "Tag: ${{ github.event.client_payload.image_tag }}"
-
-              sed -i '/^GATEWAY_TAG=/d' .env
-              echo "GATEWAY_TAG=${{ github.event.client_payload.image_tag }}" >> .env
-
-            else
-
-              echo "Manual deployment"
-
-              cat > .env <<EOF
-            MONGODB_URI=${{ secrets.MONGODB_URI }}
-            MOVIE_SERVICE_TAG=${{ inputs.movie_service_tag }}
-            GATEWAY_TAG=${{ inputs.gateway_tag }}
-            EOF
-
-            fi
-
-            chmod 600 .env
-
-            echo ""
-            echo "Deployment configuration:"
-            grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
-
-            # -------------------------------------------------
-            # Pull new images
-            # -------------------------------------------------
-
-            echo ""
-            echo "Pulling Docker images..."
-
-            docker compose pull
-
-            # -------------------------------------------------
-            # Start/recreate containers
-            # -------------------------------------------------
-
-            echo ""
-            echo "Starting containers..."
-
-            docker compose up -d --force-recreate
-
-            # -------------------------------------------------
-            # Wait for health checks
-            # -------------------------------------------------
-
-            echo ""
-            echo "Waiting for services to become healthy..."
-
-            MAX_ATTEMPTS=12
-            ATTEMPT=1
-
-            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-
-              MOVIE_STATUS=$(docker inspect movie-service \
-                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}')
-
-              GATEWAY_STATUS=$(docker inspect showtime-gateway \
-                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}')
-
-              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS"
-              echo "Movie Service : $MOVIE_STATUS"
-              echo "Gateway       : $GATEWAY_STATUS"
-
-              if [ "$MOVIE_STATUS" = "healthy" ] &&
-                 [ "$GATEWAY_STATUS" = "healthy" ]; then
-
-                echo ""
-                echo "======================================"
-                echo "Deployment successful"
-                echo "======================================"
-
-                docker compose ps
-
-                exit 0
-              fi
-
-              sleep 10
-              ATTEMPT=$((ATTEMPT + 1))
-
-            done
-
-            # -------------------------------------------------
-            # Deployment failed
-            # -------------------------------------------------
-
-            echo ""
-            echo "======================================"
-            echo "Deployment failed health checks"
-            echo "======================================"
-
-            echo ""
-            echo "Container status:"
-            docker compose ps
-
-            echo ""
-            echo "Movie Service logs:"
-            docker logs --tail 100 movie-service || true
-
-            echo ""
-            echo "Gateway logs:"
-            docker logs --tail 100 showtime-gateway || true
-
-            # -------------------------------------------------
-            # Rollback
-            # -------------------------------------------------
-
-            if [ -f .env.previous ]; then
-
-              echo ""
-              echo "======================================"
-              echo "Rolling back deployment"
-              echo "======================================"
-
-              cp .env.previous .env
-              chmod 600 .env
-
-              echo "Restoring previous image tags:"
-              grep -E '^(MOVIE_SERVICE_TAG|GATEWAY_TAG)=' .env
-
-              docker compose pull
-              docker compose up -d --force-recreate
-
-              echo ""
-              echo "Rollback completed."
-
-              docker compose ps
-
-            else
-
-              echo ""
-              echo "No previous deployment configuration found."
-              echo "Automatic rollback is not possible."
-
-            fi
-
+          if [ -n "$ACTIVE_REFRESH" ] && [ "$ACTIVE_REFRESH" != "None" ]; then
+            echo "An Instance Refresh is already active: $ACTIVE_REFRESH"
+            echo "Stopping to avoid overlapping deployments."
             exit 1
+          fi
+
+          echo "No active Instance Refresh found."
+
+      - name: Determine Deployment Tags
+        id: tags
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          DISPATCH_TAG: ${{ github.event.client_payload.image_tag }}
+          MANUAL_MOVIE_TAG: ${{ inputs.movie_service_tag }}
+          MANUAL_GATEWAY_TAG: ${{ inputs.gateway_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+
+            if [ -z "$DISPATCH_TAG" ]; then
+              echo "Image tag is missing."
+              exit 1
+            fi
+
+            if [[ ! "$DISPATCH_TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+              echo "Invalid image tag."
+              exit 1
+            fi
+
+            if [ "$EVENT_ACTION" = "deploy-movie-service" ]; then
+              echo "deploy_target=movie-service" >> "$GITHUB_OUTPUT"
+              echo "movie_service_tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
+
+            elif [ "$EVENT_ACTION" = "deploy-gateway" ]; then
+              echo "deploy_target=gateway" >> "$GITHUB_OUTPUT"
+              echo "gateway_tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
+
+            else
+              echo "Unsupported event: $EVENT_ACTION"
+              exit 1
+            fi
+
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+
+            if [[ ! "$MANUAL_MOVIE_TAG" =~ ^[a-zA-Z0-9._-]+$ ]] ||
+               [[ ! "$MANUAL_GATEWAY_TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+              echo "Invalid manual image tag."
+              exit 1
+            fi
+
+            echo "deploy_target=both" >> "$GITHUB_OUTPUT"
+            echo "movie_service_tag=$MANUAL_MOVIE_TAG" >> "$GITHUB_OUTPUT"
+            echo "gateway_tag=$MANUAL_GATEWAY_TAG" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "Unsupported workflow trigger."
+            exit 1
+          fi
+
+      - name: Update Movie Service Parameter
+        if: steps.tags.outputs.deploy_target == 'movie-service' || steps.tags.outputs.deploy_target == 'both'
+        env:
+          MOVIE_SERVICE_TAG: ${{ steps.tags.outputs.movie_service_tag }}
+        run: |
+          aws ssm put-parameter \
+            --name "/showtime/production/MOVIE_SERVICE_TAG" \
+            --type "String" \
+            --value "$MOVIE_SERVICE_TAG" \
+            --overwrite
+
+      - name: Update Gateway Parameter
+        if: steps.tags.outputs.deploy_target == 'gateway' || steps.tags.outputs.deploy_target == 'both'
+        env:
+          GATEWAY_TAG: ${{ steps.tags.outputs.gateway_tag }}
+        run: |
+          aws ssm put-parameter \
+            --name "/showtime/production/GATEWAY_TAG" \
+            --type "String" \
+            --value "$GATEWAY_TAG" \
+            --overwrite
+
+      - name: Start Auto Scaling Instance Refresh
+        run: |
+          set -euo pipefail
+
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{
+              "MinHealthyPercentage": 100,
+              "MaxHealthyPercentage": 150,
+              "InstanceWarmup": 300,
+              "SkipMatching": false
+            }'
+
+      - name: Deployment Summary
+        env:
+          DEPLOY_TARGET: ${{ steps.tags.outputs.deploy_target }}
+          MOVIE_SERVICE_TAG: ${{ steps.tags.outputs.movie_service_tag }}
+          GATEWAY_TAG: ${{ steps.tags.outputs.gateway_tag }}
+        run: |
+          echo "ShowTime deployment initiated"
+          echo "Target: $DEPLOY_TARGET"
+
+          if [ -n "${MOVIE_SERVICE_TAG:-}" ]; then
+            echo "Movie Service tag: $MOVIE_SERVICE_TAG"
+          fi
+
+          if [ -n "${GATEWAY_TAG:-}" ]; then
+            echo "Gateway tag: $GATEWAY_TAG"
+          fi
+
+          echo "Monitor Instance Refresh in AWS Console."
