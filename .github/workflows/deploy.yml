@@ -107,6 +107,25 @@ jobs:
 
           echo "No active Instance Refresh found."
 
+      - name: Capture Previous Image Tag
+        id: previous
+        run: |
+          if [ "${{ steps.target.outputs.service }}" = "movie-service" ]; then
+            PARAMETER_NAME="/showtime/production/MOVIE_SERVICE_TAG"
+          else
+            PARAMETER_NAME="/showtime/production/GATEWAY_TAG"
+          fi
+
+          PREVIOUS_TAG=$(aws ssm get-parameter \
+            --name "$PARAMETER_NAME" \
+            --query "Parameter.Value" \
+            --output text)
+
+          echo "previous_tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          echo "parameter_name=$PARAMETER_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Previous deployed image tag: $PREVIOUS_TAG"
+
       - name: Update Movie Service Image Tag
         if: steps.target.outputs.service == 'movie-service'
         run: |
