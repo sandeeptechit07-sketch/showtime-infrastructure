@@ -1,15 +1,17 @@
-
 name: Deploy ShowTime
 
 on:
   workflow_dispatch:
     inputs:
-      movie_service_tag:
-        description: "Movie Service Docker tag"
+      service:
+        description: "Which service should be deployed?"
         required: true
-        type: string
-      gateway_tag:
-        description: "Gateway Docker tag"
+        type: choice
+        options:
+          - movie-service
+          - gateway
+      image_tag:
+        description: "Docker image tag to deploy"
         required: true
         type: string
 
@@ -32,15 +34,62 @@ env:
 
 jobs:
   deploy:
-    name: Update SSM and Refresh ASG
+    name: Deploy Service to ASG
     runs-on: ubuntu-latest
 
     steps:
-      - name: Configure AWS Credentials (OIDC)
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine Deployment Target
+        id: target
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          MANUAL_SERVICE: ${{ inputs.service }}
+          MANUAL_TAG: ${{ inputs.image_tag }}
+          DISPATCH_TAG: ${{ github.event.client_payload.image_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SERVICE="$MANUAL_SERVICE"
+            TAG="$MANUAL_TAG"
+
+          elif [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            case "$EVENT_ACTION" in
+              deploy-movie-service)
+                SERVICE="movie-service"
+                ;;
+              deploy-gateway)
+                SERVICE="gateway"
+                ;;
+              *)
+                echo "Unsupported event: $EVENT_ACTION"
+                exit 1
+                ;;
+            esac
+
+            TAG="$DISPATCH_TAG"
+          else
+            echo "Unsupported trigger"
+            exit 1
+          fi
+
+          if [[ ! "$TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid Docker image tag: $TAG"
+            exit 1
+          fi
+
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Deployment target: $SERVICE"
+          echo "Image tag: $TAG"
 
       - name: Check for Active Instance Refresh
         run: |
@@ -48,97 +97,36 @@ jobs:
 
           ACTIVE_REFRESH=$(aws autoscaling describe-instance-refreshes \
             --auto-scaling-group-name "$ASG_NAME" \
-            --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress' || Status=='Baking'].InstanceRefreshId" \
+            --query "InstanceRefreshes[?Status=='Pending' || Status=='InProgress'].InstanceRefreshId" \
             --output text)
 
           if [ -n "$ACTIVE_REFRESH" ] && [ "$ACTIVE_REFRESH" != "None" ]; then
-            echo "An Instance Refresh is already active: $ACTIVE_REFRESH"
-            echo "Stopping to avoid overlapping deployments."
+            echo "An Instance Refresh is already running: $ACTIVE_REFRESH"
             exit 1
           fi
 
           echo "No active Instance Refresh found."
 
-      - name: Determine Deployment Tags
-        id: tags
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_ACTION: ${{ github.event.action }}
-          DISPATCH_TAG: ${{ github.event.client_payload.image_tag }}
-          MANUAL_MOVIE_TAG: ${{ inputs.movie_service_tag }}
-          MANUAL_GATEWAY_TAG: ${{ inputs.gateway_tag }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-
-            if [ -z "$DISPATCH_TAG" ]; then
-              echo "Image tag is missing."
-              exit 1
-            fi
-
-            if [[ ! "$DISPATCH_TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-              echo "Invalid image tag."
-              exit 1
-            fi
-
-            if [ "$EVENT_ACTION" = "deploy-movie-service" ]; then
-              echo "deploy_target=movie-service" >> "$GITHUB_OUTPUT"
-              echo "movie_service_tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
-
-            elif [ "$EVENT_ACTION" = "deploy-gateway" ]; then
-              echo "deploy_target=gateway" >> "$GITHUB_OUTPUT"
-              echo "gateway_tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
-
-            else
-              echo "Unsupported event: $EVENT_ACTION"
-              exit 1
-            fi
-
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-
-            if [[ ! "$MANUAL_MOVIE_TAG" =~ ^[a-zA-Z0-9._-]+$ ]] ||
-               [[ ! "$MANUAL_GATEWAY_TAG" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-              echo "Invalid manual image tag."
-              exit 1
-            fi
-
-            echo "deploy_target=both" >> "$GITHUB_OUTPUT"
-            echo "movie_service_tag=$MANUAL_MOVIE_TAG" >> "$GITHUB_OUTPUT"
-            echo "gateway_tag=$MANUAL_GATEWAY_TAG" >> "$GITHUB_OUTPUT"
-
-          else
-            echo "Unsupported workflow trigger."
-            exit 1
-          fi
-
-      - name: Update Movie Service Parameter
-        if: steps.tags.outputs.deploy_target == 'movie-service' || steps.tags.outputs.deploy_target == 'both'
-        env:
-          MOVIE_SERVICE_TAG: ${{ steps.tags.outputs.movie_service_tag }}
+      - name: Update Movie Service Image Tag
+        if: steps.target.outputs.service == 'movie-service'
         run: |
           aws ssm put-parameter \
             --name "/showtime/production/MOVIE_SERVICE_TAG" \
             --type "String" \
-            --value "$MOVIE_SERVICE_TAG" \
+            --value "${{ steps.target.outputs.tag }}" \
             --overwrite
 
-      - name: Update Gateway Parameter
-        if: steps.tags.outputs.deploy_target == 'gateway' || steps.tags.outputs.deploy_target == 'both'
-        env:
-          GATEWAY_TAG: ${{ steps.tags.outputs.gateway_tag }}
+      - name: Update Gateway Image Tag
+        if: steps.target.outputs.service == 'gateway'
         run: |
           aws ssm put-parameter \
             --name "/showtime/production/GATEWAY_TAG" \
             --type "String" \
-            --value "$GATEWAY_TAG" \
+            --value "${{ steps.target.outputs.tag }}" \
             --overwrite
 
       - name: Start Auto Scaling Instance Refresh
         run: |
-          set -euo pipefail
-
           aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
             --strategy Rolling \
@@ -150,20 +138,8 @@ jobs:
             }'
 
       - name: Deployment Summary
-        env:
-          DEPLOY_TARGET: ${{ steps.tags.outputs.deploy_target }}
-          MOVIE_SERVICE_TAG: ${{ steps.tags.outputs.movie_service_tag }}
-          GATEWAY_TAG: ${{ steps.tags.outputs.gateway_tag }}
         run: |
-          echo "ShowTime deployment initiated"
-          echo "Target: $DEPLOY_TARGET"
-
-          if [ -n "${MOVIE_SERVICE_TAG:-}" ]; then
-            echo "Movie Service tag: $MOVIE_SERVICE_TAG"
-          fi
-
-          if [ -n "${GATEWAY_TAG:-}" ]; then
-            echo "Gateway tag: $GATEWAY_TAG"
-          fi
-
-          echo "Monitor Instance Refresh in AWS Console."
+          echo "Deployment initiated successfully."
+          echo "Service: ${{ steps.target.outputs.service }}"
+          echo "Image tag: ${{ steps.target.outputs.tag }}"
+          echo "ASG: $ASG_NAME"
