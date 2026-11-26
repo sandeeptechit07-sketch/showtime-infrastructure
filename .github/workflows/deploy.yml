@@ -134,7 +134,15 @@ jobs:
               "MinHealthyPercentage": 100,
               "MaxHealthyPercentage": 150,
               "InstanceWarmup": 300,
-              "SkipMatching": false
+              "SkipMatching": false,
+              "AutoRollback": true,
+              "AlarmSpecification": {
+                "Alarms": [
+                  {
+                    "AlarmName": "showtime-alb-unhealthy-targets"
+                  }
+                ]
+              }
             }'
 
       - name: Deployment Summary
